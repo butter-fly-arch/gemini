@@ -189,6 +189,7 @@ For more details, refer to the [Gemini API docs](https://ai.google.dev/gemini-ap
 
   </details>
 - [ ] `completions`
+- [x] `responses`
 - [x] `embeddings`
   - [x] `dimensions`
 - [x] `models`
