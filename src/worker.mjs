@@ -23,6 +23,10 @@ export default {
           assert(request.method === "POST");
           return handleCompletions(await request.json(), apiKey)
             .catch(errHandler);
+        case pathname.endsWith("/responses"):
+          assert(request.method === "POST");
+          return handleResponses(await request.json(), apiKey)
+            .catch(errHandler);
         case pathname.endsWith("/embeddings"):
           assert(request.method === "POST");
           return handleEmbeddings(await request.json(), apiKey)
@@ -224,6 +228,178 @@ async function handleCompletions (req, apiKey) {
     }
   }
   return new Response(body, fixCors(response));
+}
+
+const normalizeResponsesContent = (content) => {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  return content.map((item) => {
+    switch (item.type) {
+      case "input_text":
+        return { type: "text", text: item.text };
+      case "input_image":
+        return {
+          type: "image_url",
+          image_url: {
+            url: item.image_url ?? item.url ?? item.image,
+          },
+        };
+      default:
+        return item;
+    }
+  });
+};
+
+const normalizeResponsesMessages = (req) => {
+  let messages = req.messages;
+  if (!messages && req.input !== undefined) {
+    if (typeof req.input === "string") {
+      messages = [{ role: "user", content: req.input }];
+    } else if (Array.isArray(req.input)) {
+      if (req.input.every(item => typeof item === "string")) {
+        messages = [{ role: "user", content: req.input.join("\n") }];
+      } else if (req.input.every(item => item && typeof item === "object" && "role" in item)) {
+        messages = req.input;
+      } else {
+        messages = [{ role: "user", content: req.input }];
+      }
+    } else if (typeof req.input === "object") {
+      messages = [req.input];
+    }
+  }
+  if (Array.isArray(messages)) {
+    messages = messages.map((item) => ({
+      ...item,
+      content: normalizeResponsesContent(item.content),
+    }));
+  }
+  if (req.instructions) {
+    messages = [{ role: "system", content: req.instructions }, ...(messages ?? [])];
+  }
+  return messages;
+};
+
+const normalizeResponsesRequest = (req) => ({
+  ...req,
+  messages: normalizeResponsesMessages(req),
+  max_completion_tokens: req.max_completion_tokens ?? req.max_output_tokens,
+});
+
+const makeResponseUsage = (usage) => usage && ({
+  input_tokens: usage.prompt_tokens,
+  output_tokens: usage.completion_tokens,
+  total_tokens: usage.total_tokens,
+});
+
+const makeResponsesOutput = (message, index = 0) => ({
+  id: "msg_" + generateId(),
+  type: "message",
+  role: message?.role ?? "assistant",
+  content: [
+    {
+      type: "output_text",
+      text: message?.content ?? "",
+    },
+  ],
+  status: "completed",
+  index,
+});
+
+const processResponsesResponse = (data, model, id) => {
+  const message = data.candidates.map(transformCandidates.bind({}, "message"))[0]?.message;
+  const responseId = data.responseId ? `resp_${data.responseId}` : `resp_${id}`;
+  let output = message ? [makeResponsesOutput(message)] : [];
+  if (output.length === 0 && data.promptFeedback?.blockReason) {
+    output = [makeResponsesOutput({ role: "assistant", content: "" })];
+  }
+  return JSON.stringify({
+    id: responseId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    model: data.modelVersion ?? model,
+    status: "completed",
+    output,
+    usage: data.usageMetadata && makeResponseUsage(transformUsage(data.usageMetadata)),
+  });
+};
+
+async function handleResponses (req, apiKey) {
+  const normalized = normalizeResponsesRequest(req);
+  let model = normalized.model;
+  switch (true) {
+    case typeof model !== "string":
+      throw new HttpError("model is not specified", 400);
+    case model.startsWith("models/"):
+      model = model.substring(7);
+      break;
+    case model.startsWith("gemini-"):
+    case model.startsWith("gemma-"):
+      break;
+    default:
+      model = DEFAULT_MODEL;
+  }
+  const isV3 = model.startsWith("gemini-3");
+  let body = await transformRequest(normalized, isV3);
+  const extra = normalized.extra_body?.google;
+  if (extra) {
+    if (extra.safety_settings) {
+      body.safetySettings = extra.safety_settings;
+    }
+    if (extra.cached_content) {
+      body.cachedContent = extra.cached_content;
+    }
+    if (extra.thinking_config) {
+      body.generationConfig.thinkingConfig = extra.thinking_config;
+    }
+  }
+  const TASK = normalized.stream ? "streamGenerateContent" : "generateContent";
+  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+  if (normalized.stream) { url += "?alt=sse"; }
+  const response = await fetch(url, {
+    method: "POST",
+    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+
+  let { body: responseBody } = response;
+  if (response.ok) {
+    const id = generateId();
+    const shared = {};
+    if (normalized.stream) {
+      responseBody = response.body
+        .pipeThrough(new TextDecoderStream())
+        .pipeThrough(new TransformStream({
+          transform: parseStream,
+          flush: parseStreamFlush,
+          buffer: "",
+          shared,
+        }))
+        .pipeThrough(new TransformStream({
+          transform: toResponsesStream,
+          flush: toResponsesStreamFlush,
+          responseId: `resp_${id}`,
+          messageId: `msg_${generateId()}`,
+          model,
+          last: [],
+          shared,
+        }))
+        .pipeThrough(new TextEncoderStream());
+    } else {
+      responseBody = await response.text();
+      try {
+        responseBody = JSON.parse(responseBody);
+        if (!responseBody.candidates) {
+          throw new Error("Invalid completion object");
+        }
+      } catch (err) {
+        console.error("Error parsing response:", err);
+        return new Response(responseBody, fixCors(response));
+      }
+      responseBody = processResponsesResponse(responseBody, model, id);
+    }
+  }
+  return new Response(responseBody, fixCors(response));
 }
 
 const adjustProps = (schemaPart) => {
@@ -743,4 +919,107 @@ function toOpenAiStreamFlush (controller) {
     }
     controller.enqueue("data: [DONE]" + delimiter);
   }
+}
+
+const responsesEvent = (obj) => "data: " + JSON.stringify(obj) + delimiter;
+function toResponsesStream (line, controller) {
+  let data;
+  try {
+    data = JSON.parse(line);
+    if (!data.candidates) {
+      throw new Error("Invalid completion chunk object");
+    }
+  } catch (err) {
+    console.error("Error parsing response:", err);
+    if (!this.shared.is_buffers_rest) { line =+ delimiter; }
+    controller.enqueue(line);
+    return;
+  }
+  if (!this.created) {
+    this.created = Math.floor(Date.now() / 1000);
+    controller.enqueue(responsesEvent({
+      type: "response.created",
+      response: {
+        id: this.responseId,
+        object: "response",
+        created_at: this.created,
+        model: data.modelVersion ?? this.model,
+        status: "in_progress",
+        output: [],
+      },
+    }));
+  }
+  let obj;
+  try {
+    obj = {
+      id: data.responseId ?? this.responseId,
+      choices: data.candidates.map(transformCandidates.bind(this, "delta")),
+      model: data.modelVersion ?? this.model,
+      object: "chat.completion.chunk",
+      usage: data.usageMetadata ? null : undefined,
+    };
+  } catch (err) {
+    console.error(err);
+    controller.enqueue("Unexpected error while handling request: " + err.message);
+    controller.enqueue("\n\n" + line);
+    controller.terminate();
+    return;
+  }
+  const choices = obj.choices ?? [];
+  for (const choice of choices) {
+    const deltaText = choice.delta?.content ?? "";
+    if (deltaText) {
+      this.outputText = (this.outputText ?? "") + deltaText;
+      controller.enqueue(responsesEvent({
+        type: "response.output_text.delta",
+        output_index: 0,
+        content_index: 0,
+        delta: deltaText,
+      }));
+    }
+  }
+  if (checkPromptBlock(obj.choices, data.promptFeedback, "delta")) {
+    return;
+  }
+  if (data.usageMetadata) {
+    this.usage = makeResponseUsage(transformUsage(data.usageMetadata));
+  }
+  this.last = obj.choices;
+}
+
+function toResponsesStreamFlush (controller) {
+  if (!this.created) { return; }
+  controller.enqueue(responsesEvent({
+    type: "response.output_text.done",
+    output_index: 0,
+    content_index: 0,
+    text: this.outputText ?? "",
+  }));
+  controller.enqueue(responsesEvent({
+    type: "response.completed",
+    response: {
+      id: this.responseId,
+      object: "response",
+      created_at: this.created,
+      model: this.model,
+      status: "completed",
+      output: [
+        {
+          id: this.messageId,
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: this.outputText ?? "",
+            },
+          ],
+          index: 0,
+        },
+      ],
+      usage: this.usage,
+    },
+  }));
+  controller.enqueue("data: [DONE]" + delimiter);
 }
